@@ -406,7 +406,7 @@ def choose_images() -> list[Path]:
 
 
 def collect_image_paths(image_args: Sequence[str] | None) -> list[Path]:
-    """Resolve CLI paths, a folder of images, or a file-picker selection."""
+    """Resolve CLI paths, a folder of images (recursive), or a file-picker selection."""
     if not image_args:
         paths = choose_images()
         if not paths:
@@ -419,7 +419,7 @@ def collect_image_paths(image_args: Sequence[str] | None) -> list[Path]:
         if path.is_dir():
             found = sorted(
                 child
-                for child in path.iterdir()
+                for child in path.rglob("*")
                 if child.is_file() and child.suffix.lower() in _IMAGE_EXTS
             )
             if not found:
@@ -430,11 +430,34 @@ def collect_image_paths(image_args: Sequence[str] | None) -> list[Path]:
     return paths
 
 
-def output_path_for(image_path: Path, output_arg: str, image_count: int) -> Path:
-    output = Path(output_arg)
-    if image_count == 1:
-        return output
-    return output.parent / f"{image_path.stem}_detected{output.suffix}"
+def _unique_output_name(image_path: Path, name_roots: Sequence[Path]) -> str:
+    """Build a collision-safe filename (e.g. 741407_424082.png for tile grids)."""
+    resolved = image_path.resolve()
+    for root in name_roots:
+        try:
+            rel = resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if len(rel.parts) > 1:
+            return "_".join(rel.parts)
+        return rel.name
+    parent = image_path.parent.name
+    if parent:
+        return f"{parent}_{image_path.name}"
+    return image_path.name
+
+
+def output_path_for(
+    image_path: Path,
+    output_root: str | Path,
+    has_detections: bool,
+    name_roots: Sequence[Path] | None = None,
+) -> Path:
+    """Route annotated images into output/detected or output/not_detected."""
+    root = Path(output_root)
+    bucket = "detected" if has_detections else "not_detected"
+    filename = _unique_output_name(image_path, name_roots or ())
+    return root / bucket / filename
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -478,8 +501,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="output/detected.png",
-        help="Annotated output image path",
+        default="output",
+        help="Output root folder (writes to detected/ and not_detected/ inside it)",
     )
     return parser.parse_args(argv)
 
@@ -497,6 +520,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+    output_root = Path(args.output)
+    detected_dir = output_root / "detected"
+    not_detected_dir = output_root / "not_detected"
+    detected_dir.mkdir(parents=True, exist_ok=True)
+    not_detected_dir.mkdir(parents=True, exist_ok=True)
+
+    name_roots = [Path(raw) for raw in requested if Path(raw).is_dir()]
 
     exit_code = 0
     for image_path in image_paths:
@@ -525,7 +556,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         _print_detections(detections)
 
-        output_path = output_path_for(image_path, args.output, len(image_paths))
+        output_path = output_path_for(
+            image_path,
+            output_root,
+            has_detections=bool(detections),
+            name_roots=name_roots,
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         annotated = draw_detections(image, detections)
         if not cv2.imwrite(str(output_path), annotated):
